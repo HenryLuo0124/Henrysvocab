@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Center the reference lettering and leave room for the circular launcher mask. -->
+    <group
+        android:scaleX="0.75"
+        android:scaleY="0.75"
+        android:translateX="14.625"
+        android:translateY="17.925">
+        <path
+            android:fillColor="#FF0000"
+            android:pathData="M19.7,17.5 C23.4,17.5 26.4,20.5 26.4,24.2
+                L26.4,37.9 Q26.4,39.5 28,39.5 L34.5,39.5 Q36.1,39.5 36.1,37.9
+                L36.1,24.15 C36.1,20.48 39.08,17.5 42.75,17.5 C46.42,17.5 49.4,20.48 49.4,24.15
+                L49.4,72.05 C49.4,75.72 46.42,78.7 42.75,78.7 C39.08,78.7 36.1,75.72 36.1,72.05
+                L36.1,52.8 Q36.1,51.2 34.5,51.2 L28,51.2 Q26.4,51.2 26.4,52.8
+                L26.4,72 C26.4,75.7 23.4,78.7 19.7,78.7 C16,78.7 13,75.7 13,72
+                L13,24.2 C13,20.5 16,17.5 19.7,17.5 Z" />
+        <path
+            android:fillColor="#00F2FA"
+            android:pathData="M57.7,17.8 C61.3,16.9 65,19.1 66,22.7
+                L71.75,46.5 Q72.5,49.6 73.25,46.5 L78.8,22.7
+                C79.8,19.1 83.4,16.8 87,17.8 C90.6,18.8 92.7,22.4 91.7,26
+                L79.1,73.5 C78.25,76.7 75.8,78.7 72.5,78.7 C69.2,78.7 66.55,76.7 65.7,73.5
+                L53,26 C52,22.4 54.1,18.8 57.7,17.8 Z" />
+    </group>
+</vector>
