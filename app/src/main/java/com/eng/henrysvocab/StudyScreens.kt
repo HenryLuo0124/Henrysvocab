@@ -34,6 +34,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
@@ -174,6 +175,9 @@ internal fun StudyScreen(
     primaryLabel: String,
     error: String?,
     onDiscard: (() -> Unit)? = null,
+    onModelLookup: (() -> Unit)? = null,
+    workspaceStatus: String? = null,
+    onWorkspaceRetry: (() -> Unit)? = null,
 ) {
     // Each new word or reveal starts at the top, even after a long entry or answer.
     key(word, title, answer == null) {
@@ -191,6 +195,7 @@ internal fun StudyScreen(
             }
             Spacer(Modifier.height((height * 0.085f).coerceIn(16.dp, 56.dp)))
             StudyTerm(term = word.term, onLookupWord = onLookupWord)
+            onModelLookup?.let { TextButton(onClick = it, enabled = !busy) { Text("搜索（模型查词）") } }
             Spacer(Modifier.height(16.dp))
 
             if (answer == null) {
@@ -254,6 +259,12 @@ internal fun StudyScreen(
                         errorLabelColor = ErrorInk,
                     ),
                 )
+            }
+
+            workspaceStatus?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, color = SecondaryInk, style = MaterialTheme.typography.bodyMedium)
+                onWorkspaceRetry?.let { retry -> TextButton(onClick = retry, enabled = !busy) { Text("重试补充队列") } }
             }
 
             if (!error.isNullOrBlank()) {

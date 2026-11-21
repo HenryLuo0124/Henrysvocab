@@ -340,6 +340,40 @@ class VocabStoreMigrationTest {
         }
     }
 
+    @Test
+    fun refillAtFiveKeepsEarlierCardsAndAuthoredFieldsSurviveReopenAndRestore() = withDatabaseName { name ->
+        val original = Word("bank", listOf("shore", "."), ".")
+        val id = testDatabase(name).use { db ->
+            val store = VocabStore(db)
+            val id = store.add("Book", List(40) { if (it == 15) original else Word("term-$it", listOf("meaning"), ".") }).id
+            assertEquals((0..19).toList(), store.fillLearning(id, prefetch = true))
+            store.setDedupEnabled(id, true)
+            for (index in 0..13) assertTrue(store.discardLearning(id, index))
+            assertEquals((14..19).toList(), store.fillLearning(id, prefetch = true))
+            assertNull(store.pendingDedup(id, prefetch = true))
+            assertTrue(store.completeLearning(id, 14, 100))
+            val batch = checkNotNull(store.pendingDedup(id, prefetch = true))
+            assertEquals(20, batch.start)
+            assertTrue(store.applyDedup(batch, setOf(0), prefetch = true))
+            assertEquals((15..39).toList() - 20, store.pendingLearning(id))
+            assertFalse(store.applyDedup(batch, setOf(1), prefetch = true))
+            assertEquals(LearningEntry(15, original), store.pendingLearningEntries(id).first())
+            id
+        }
+        testDatabase(name).use { db ->
+            val store = VocabStore(db)
+            assertEquals(LearningEntry(15, original), store.pendingLearningEntries(id).first())
+            val backup = store.exportBackup()
+            assertTrue(store.completeLearning(id, 15, 100))
+            store.restoreBackup(backup)
+            assertEquals((15..39).toList() - 20, store.pendingLearning(id))
+            assertEquals(original, store.books().single().words[15])
+            assertTrue(store.completeLearning(id, 15, 100))
+            assertEquals(original, store.reviewWord(ReviewCard(id, 15, 0, 101)))
+            assertEquals(2, store.todayCount(100))
+        }
+    }
+
     private fun testDatabase(name: String) = VocabDatabase(context, name)
 
     private fun learnedFile(name: String) = AppDataDirectory(context).file("$name-learned.txt")

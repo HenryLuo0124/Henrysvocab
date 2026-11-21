@@ -9,7 +9,8 @@ import org.json.JSONObject
 /** Logical archive versioning is independent of the SQLite schema version. */
 internal object VocabBackup {
     private const val LEGACY_VERSION = 1L
-    private const val VERSION = 2L
+    private const val SINGLE_BATCH_VERSION = 2L
+    private const val VERSION = 3L
 
     private enum class Kind { TEXT, INT, NULLABLE_INT, MEANINGS }
     private data class Column(val name: String, val kind: Kind)
@@ -53,7 +54,7 @@ internal object VocabBackup {
     fun restore(db: SQLiteDatabase, data: JSONObject) {
         check(db.inTransaction())
         val version = data.get("version").integer()
-        require(version == LEGACY_VERSION || version == VERSION) { "Unsupported vocabulary backup version" }
+        require(version in LEGACY_VERSION..VERSION) { "Unsupported vocabulary backup version" }
         val rowsByTable = tables.associateWith {
             if (version == LEGACY_VERSION && it.name in setOf("learned_history", "pending_learning")) null
             else data.getJSONArray(it.name)
@@ -90,7 +91,7 @@ internal object VocabBackup {
                 db.insertOrThrow(table.name, null, values)
             }
         }
-        validate(db)
+        validate(db, version)
     }
 
     private fun Cursor.value(index: Int, kind: Kind): Any = when (kind) {
@@ -106,7 +107,7 @@ internal object VocabBackup {
         else -> throw IllegalArgumentException("Expected an integer in vocabulary backup")
     }
 
-    private fun validate(db: SQLiteDatabase) {
+    private fun validate(db: SQLiteDatabase, version: Long) {
         db.requireNoRows(
             """
             SELECT 1 FROM books b WHERE b.word_count NOT BETWEEN 0 AND ${Int.MAX_VALUE}
@@ -127,8 +128,13 @@ internal object VocabBackup {
             SELECT 1 FROM pending_learning p JOIN words w USING (book_id, word_index)
             JOIN books b ON b.id = p.book_id
             WHERE w.learned != 0 OR w.hidden != 0
-               OR p.word_index NOT BETWEEN b.position - $LEARNING_BATCH_SIZE AND b.position - 1
+               OR p.word_index >= b.position
+               ${if (version <= SINGLE_BATCH_VERSION) "OR p.word_index < b.position - $LEARNING_BATCH_SIZE" else ""}
             """.trimIndent(), "Invalid pending learning batch",
+        )
+        db.requireNoRows(
+            "SELECT 1 FROM pending_learning GROUP BY book_id HAVING COUNT(*) > ${LEARNING_BATCH_SIZE + LEARNING_REFILL_AT}",
+            "Too many pending learning cards",
         )
         db.requireNoRows(
             """

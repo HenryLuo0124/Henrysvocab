@@ -127,7 +127,7 @@ internal fun BackupScreen(
     BackHandler(enabled = !enabled) { /* Do not leave the screen during a picker or write. */ }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         ScreenHeader("备份与恢复", onBack = { if (enabled) onBack() })
-        Text("这是手动加密备份，不会自动运行。备份包含词书和学习进度、自定义壁纸，以及模型配置（含已存储的 API 密钥）。")
+        Text("这是手动加密备份，不会自动运行。备份包含应用内词书、学习进度、自定义壁纸，以及模型配置（含已存储的 API 密钥）。")
         Text("请保存到卸载应用后仍保留的文件夹，例如下载目录、SD 卡或云盘。恢复时必须输入原密码，忘记密码无法找回。")
         Text("恢复会替换当前的词书、学习进度、壁纸及模型配置。请仅恢复自己信任的备份：恢复的模型网址将用于后续请求。")
         GlassButton("创建加密备份", {

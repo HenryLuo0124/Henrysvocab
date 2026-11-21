@@ -37,6 +37,9 @@ internal class BackupRollbackException : IOException()
 
 private const val MAX_MODEL_BYTES = 64 * 1024
 private const val MODEL_IDS_FIELD = "modelIds"
+// Read-only compatibility with backups made while auto-fill was available.
+private const val LEGACY_MEANING_LIMIT_FIELD = "maxGeneratedMeanings"
+private const val LEGACY_GENERATE_EXAMPLES_FIELD = "generateExamples"
 private const val MAX_VOCAB_BYTES = 12 * 1024 * 1024
 private const val MAX_PNG_BYTES = 18 * 1024 * 1024
 private const val MAX_WALLPAPER_EDGE = 2048
@@ -141,7 +144,10 @@ internal class AppBackup(
             )
             val model = readObject(bytes, PAYLOAD_HEADER_BYTES, modelSize)
             val hasCatalog = model.has(MODEL_IDS_FIELD)
-            checkFormat(model.length() == if (hasCatalog) 6 else 5)
+            // Drop only the retired settings; keep the strict shape check for all other fields.
+            model.remove(LEGACY_MEANING_LIMIT_FIELD)
+            model.remove(LEGACY_GENERATE_EXAMPLES_FIELD)
+            checkFormat(model.length() == 5 + (if (hasCatalog) 1 else 0))
             val config = ModelConfig(
                 apiKey = model["apiKey"] as String,
                 model = model["model"] as String,

@@ -219,6 +219,7 @@ internal fun BooksScreen(
         SettingsPanel {
             Text("导入词书", style = MaterialTheme.typography.titleMedium)
             SettingsNote("选择 UTF-8 文本文件，每行一个词条，格式：term/(meaning1/meaning2)/example")
+            SettingsNote("请自行准备释义和例句。释义或例句中的独立 . 占位符会原样保留，应用不会自动补全。")
             GlassButton("选择文本文件", {
                 action.openPicker("无法打开文件选择器。") { picker.launch(arrayOf("text/plain")) }
             }, Modifier.fillMaxWidth(), enabled = !action.busy)
@@ -578,7 +579,7 @@ internal fun ModelScreen(
                 error = !validKey)
         }
         SettingsPanel {
-            Text("复习模型", style = MaterialTheme.typography.titleMedium)
+            Text("学习与复习模型", style = MaterialTheme.typography.titleMedium)
             SettingsNote("可使用上方填写的服务商设置获取模型，也可手动添加模型标识。点击「保存配置」后，服务商设置和所选模型一同生效。")
             GlassButton("获取模型列表", {
                 if (providerModels is ProviderModelsState.Loading || action.busy) return@GlassButton
@@ -634,7 +635,8 @@ internal fun ModelScreen(
         }
         SettingsPanel {
             Text("模型请求会发送哪些数据？", style = MaterialTheme.typography.titleMedium)
-            SettingsNote("判定复习答案时，应用会通过 HTTPS 向配置的服务商发送当前单词、释义、例句、你输入的答案、模型标识和判定指令。对已开启模型查重的词书，查重时会发送每批最多 $LEARNING_BATCH_SIZE 个候选词条和已学词条历史。API 密钥随请求用于身份验证。")
+            SettingsNote("学习时，只有开启了模型查重的词书才会自动发送请求。查重只发送词条：每批最多 $LEARNING_BATCH_SIZE 个候选词，以及已学词条。应用不会发送你填写的释义或例句用于自动补全。")
+            SettingsNote("手动选择模型查词时，只发送当前词条；查询结果不会修改词书，也不是实时网页搜索。提交复习答案以判定正误时，会发送当前词条、已有释义和例句、你输入的答案及判定指令。请求使用 HTTPS，包含模型标识；API 密钥用于身份验证。")
             SettingsNote("每次都是新的无状态请求，不会延续之前的对话。这不代表服务商不会记录或保留数据；请查看其隐私和数据保留政策。")
         }
         SettingsMessages(action)

@@ -18,6 +18,7 @@ internal data class Book(val id: String, val name: String, val words: List<Word>
 internal data class DedupBatch(val entries: List<Word>, val bookId: String, val start: Int)
 
 internal const val LEARNING_BATCH_SIZE = 20
+internal const val LEARNING_REFILL_AT = 5
 private const val DATABASE_VERSION = 4
 private const val REVIEW_IDENTITY = "book_id = ? AND word_index = ?"
 private const val REVIEW_MATCH = "$REVIEW_IDENTITY AND step = ? AND due_day = ?"
@@ -28,7 +29,8 @@ private fun ReviewCard.matchArgs() = arrayOf(bookId, wordIndex.toString(), step.
 private const val MAX_IMPORT_CHARS = 4 * 1024 * 1024
 private const val MAX_LINE_CHARS = 8_192
 private const val MAX_WORDS = 20_000
-private const val MAX_MEANINGS = 64
+private const val MAX_WORD_MEANINGS = 64
+
 
 /** Parses a caller-owned reader. Blank lines are ignored, but still count in errors. */
 internal fun parseWords(reader: Reader): List<Word> {
@@ -98,8 +100,22 @@ private fun parseWord(line: String, lineNumber: Int): Word {
     if (!suffix.startsWith('/')) invalidLine(lineNumber, "Expected '/' before example")
     val example = suffix.substring(1).trim()
     if (example.isEmpty()) invalidLine(lineNumber, "Missing example")
-    val meanings = line.substring(open + 1, close).split('/', limit = MAX_MEANINGS + 1).map { it.trim() }
-    if (meanings.size > MAX_MEANINGS) invalidLine(lineNumber, "Maximum of $MAX_MEANINGS meanings exceeded")
+    val meanings = buildList {
+        var start = open + 1
+        var nested = 0
+        for (i in start until close) {
+            when (line[i]) {
+                '(' -> nested++
+                ')' -> nested--
+                '/' -> if (nested == 0) {
+                    add(line.substring(start, i).trim())
+                    start = i + 1
+                }
+            }
+        }
+        add(line.substring(start, close).trim())
+    }
+    if (meanings.size > MAX_WORD_MEANINGS) invalidLine(lineNumber, "Maximum of $MAX_WORD_MEANINGS meanings exceeded")
     if (meanings.any { it.isEmpty() }) invalidLine(lineNumber, "Meanings must not be blank")
     return Word(term, meanings, example)
 }
@@ -191,17 +207,19 @@ internal class VocabStore(private val helper: VocabDatabase) {
 
     fun pendingLearning(id: String): List<Int> = helper.readableDatabase.readPendingLearning(id)
 
-    /** Fills one original slice without running dedup, or returns the existing queue untouched. */
-    fun fillLearning(id: String): List<Int> = synchronized(helper) {
+    fun pendingLearningEntries(id: String): List<LearningEntry> = helper.readableDatabase.readLearningEntries(id)
+
+    /** Appends one original slice without running dedup if the queue is at or below the threshold. */
+    fun fillLearning(id: String, prefetch: Boolean = false): List<Int> = synchronized(helper) {
         val db = helper.writableDatabase
         val (indices, changed) = db.inTransaction {
             val current = readPendingLearning(id)
-            if (current.isNotEmpty()) return@inTransaction current to false
+            if (current.size > refillThreshold(prefetch)) return@inTransaction current to false
             val state = learningState(id) ?: return@inTransaction emptyList<Int>() to false
             // Legacy v3 could pre-check up to 50 words. Don't recheck the remainder, but still
             // queue at most one 20-source slice at a time, including previously hidden words.
             val limit = if (state.dedup) state.checkedUntil else state.size
-            if (state.position >= limit) return@inTransaction emptyList<Int>() to false
+            if (state.position >= limit) return@inTransaction current to false
             val end = state.position + minOf(LEARNING_BATCH_SIZE, limit - state.position)
             enqueueLearning(id, state.position, end) to true
         }
@@ -281,12 +299,13 @@ internal class VocabStore(private val helper: VocabDatabase) {
         )
     }
 
-    /** Returns the next unchecked original slice only when the pending learning queue is empty. */
-    fun pendingDedup(id: String): DedupBatch? = helper.writableDatabase.inTransaction { pendingBatch(id) }
+    /** Returns the next unchecked original slice only when the queue is at or below the threshold. */
+    fun pendingDedup(id: String, prefetch: Boolean = false): DedupBatch? =
+        helper.writableDatabase.inTransaction { pendingBatch(id, prefetch) }
 
     /** Duplicate offsets are relative to batch.start. Revalidate the whole slice before committing. */
-    fun applyDedup(batch: DedupBatch, duplicateIndexes: Set<Int>): Boolean = studyChange {
-        val pending = pendingBatch(batch.bookId) ?: return@studyChange false
+    fun applyDedup(batch: DedupBatch, duplicateIndexes: Set<Int>, prefetch: Boolean = false): Boolean = studyChange {
+        val pending = pendingBatch(batch.bookId, prefetch) ?: return@studyChange false
         if (pending != batch) return@studyChange false
         val duplicates = duplicateIndexes.toList()
         if (duplicates.any { it !in pending.entries.indices }) return@studyChange false
@@ -613,10 +632,14 @@ private fun SQLiteDatabase.learningState(id: String): LearningState? = rawQuery(
     "SELECT position, word_count, dedup_enabled, dedup_checked_until FROM books WHERE id = ?", arrayOf(id),
 ).use { if (it.moveToFirst()) LearningState(it.getInt(0), it.getInt(1), it.getInt(2) == 1, it.getInt(3)) else null }
 
-private fun SQLiteDatabase.pendingBatch(id: String): DedupBatch? {
+private fun refillThreshold(prefetch: Boolean) = if (prefetch) LEARNING_REFILL_AT else 0
+
+private fun SQLiteDatabase.pendingBatch(id: String, prefetch: Boolean): DedupBatch? {
     val state = learningState(id) ?: return null
     val start = state.position
-    if (!state.dedup || start < state.checkedUntil || start >= state.size || readPendingLearning(id).isNotEmpty()) return null
+    if (!state.dedup || start < state.checkedUntil || start >= state.size ||
+        readPendingLearning(id).size > refillThreshold(prefetch)
+    ) return null
     val count = minOf(state.size - start, LEARNING_BATCH_SIZE)
     val entries = rawQuery(
         """
@@ -645,6 +668,14 @@ private fun Cursor.studyWordJson(): JSONObject = JSONObject().apply {
 private fun SQLiteDatabase.readPendingLearning(id: String): List<Int> = rawQuery(
     "SELECT word_index FROM pending_learning WHERE book_id = ? ORDER BY word_index", arrayOf(id),
 ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getInt(0)) } }
+
+private fun SQLiteDatabase.readLearningEntries(id: String): List<LearningEntry> = rawQuery(
+    """
+    SELECT p.word_index, w.term, w.meanings, w.example
+    FROM pending_learning p JOIN words w USING (book_id, word_index)
+    WHERE p.book_id = ? AND w.hidden = 0 AND w.learned = 0 ORDER BY p.word_index
+    """.trimIndent(), arrayOf(id),
+).use { cursor -> buildList { while (cursor.moveToNext()) add(LearningEntry(cursor.getInt(0), cursor.wordAt(1))) } }
 
 /** Advances by the original slice, not by the number of cards that survived dedup. */
 private fun SQLiteDatabase.enqueueLearning(id: String, start: Int, end: Int): List<Int> {

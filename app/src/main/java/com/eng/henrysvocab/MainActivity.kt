@@ -26,7 +26,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -97,7 +96,7 @@ private data class SavedReviewCard(
 private data class SavedReviewReveal(val card: SavedReviewCard, val correct: Boolean) : Serializable
 
 private data class LearningBatch(
-    val indexes: List<Int> = emptyList(),
+    val entries: List<LearningEntry> = emptyList(),
     val status: String? = null,
     val canRetry: Boolean = true,
 )
@@ -148,6 +147,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
     var reviewStatus by remember { mutableStateOf(SyncingReviewStatus) }
     var config by remember { mutableStateOf(ModelConfig()) }
     var modelLoaded by remember { mutableStateOf(false) }
+    var modelLoadComplete by remember { mutableStateOf(false) }
     var wallpaper by remember { mutableStateOf<Bitmap?>(null) }
     var defaultPhoto by remember { mutableStateOf<Bitmap?>(null) }
     var loaded by remember { mutableStateOf(false) }
@@ -166,7 +166,9 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
     // If recreated during a SQLite commit, reopen from the due queue instead of replaying it.
     var reviewCommitPending by rememberSaveable { mutableStateOf(false) }
     var actionJob by remember { mutableStateOf<Job?>(null) }
-    var checkingDuplicates by remember { mutableStateOf(false) }
+    var preparingLearning by remember { mutableStateOf(false) }
+    var dedupFailure by rememberSaveable { mutableStateOf<String?>(null) }
+    var lookupResult by remember { mutableStateOf<Pair<String, List<LookupMeaning>>?>(null) }
     var studyError by remember { mutableStateOf<String?>(null) }
     var discardConfirmation by remember { mutableStateOf<DiscardConfirmation?>(null) }
     var notice by remember { mutableStateOf<Pair<String, String?>?>(null) }
@@ -177,11 +179,14 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
     fun cancelAction() {
         actionJob?.cancel()
         actionJob = null
-        checkingDuplicates = false
     }
     fun clearStudySession() {
         studyBookId = ""
+        learningRefresh++
         learningBatch = null
+        preparingLearning = false
+        dedupFailure = null
+        lookupResult = null
         reviewQueue = arrayListOf()
         reviewStale = false
         reviewCommitPending = false
@@ -205,6 +210,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
         selected = null
         config = ModelConfig()
         modelLoaded = false
+        modelLoadComplete = false
         wallpaper = null
         refreshBooks()
         restoreRefresh++
@@ -233,7 +239,6 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                 onError(if (e is IOException) e.message ?: "操作失败，请重试。" else "操作失败，请重试。")
             } finally {
                 if (actionJob === running) {
-                    checkingDuplicates = false
                     actionJob = null
                 }
             }
@@ -269,6 +274,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
         } catch (_: Exception) {
             notice = "读取模型配置失败，请在模型设置中检查并保存配置。" to "model"
         }
+        modelLoadComplete = true
     }
     LaunchedEffect(refresh) {
         try {
@@ -328,63 +334,74 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
 
     val route = stack.last()
     val learningBook = books.find { it.id == studyBookId }
+    fun searchVocabulary(term: String) {
+        if (actionJob != null || preparingLearning) return
+        studyError = null
+        perform({ studyError = it }) {
+            if (!modelLoaded) throw IOException("模型设置尚未就绪，请检查设置后重试。")
+            lookupResult = term to lookupVocabulary(config, term)
+        }
+    }
+
+    fun retryLearning() {
+        dedupFailure = null
+        preparingLearning = true
+        learningRefresh++
+    }
+
     if (route == "learn") {
-        LaunchedEffect(studyBookId, learningBook, loaded, learningRefresh) {
-            if (!loaded) return@LaunchedEffect
+        LaunchedEffect(studyBookId, learningBook, loaded, modelLoadComplete, learningRefresh) {
+            if (!loaded || !modelLoadComplete) return@LaunchedEffect
             val book = learningBook
             if (book == null) {
                 learningBatch = LearningBatch(status = "找不到当前词书，请返回首页重新选择。", canRetry = false)
+                preparingLearning = false
                 return@LaunchedEffect
             }
-            learningBatch = null
+            val id = book.id
+            val attempt = learningRefresh
+            preparingLearning = true
             try {
-                val id = book.id
-                var indexes = withContext(Dispatchers.IO) {
-                    store.pendingLearning(id).ifEmpty {
-                        ensureActive()
-                        store.fillLearning(id)
-                    }
+                val indexes = withContext(Dispatchers.IO) {
+                    val before = store.pendingLearning(id)
+                    ensureActive()
+                    before to store.fillLearning(id, prefetch = true)
                 }
-                if (indexes.isEmpty()) {
-                    // At most one unchecked source slice per attempt, even if all entries are skipped.
-                    val batch = withContext(Dispatchers.IO) { store.pendingDedup(id) }
+                if (indexes.first == indexes.second && indexes.second.size <= LEARNING_REFILL_AT && dedupFailure == null) {
+                    // Check only the next unchecked slice, never entries already in the queue.
+                    val batch = withContext(Dispatchers.IO) { store.pendingDedup(id, prefetch = true) }
                     if (batch != null) {
-                        checkingDuplicates = true
-                        val learned = withContext(Dispatchers.IO) { store.learnedTerms() }
-                        val duplicates = if (learned.isEmpty()) emptySet() else {
-                            if (!modelLoaded) {
-                                throw IOException("模型设置尚未就绪，未跳过任何词。请检查设置后重试。")
-                            }
-                            try {
+                        try {
+                            val learned = withContext(Dispatchers.IO) { store.learnedTerms() }
+                            val duplicates = if (learned.isEmpty()) emptySet() else {
+                                if (!modelLoaded) throw IOException()
                                 findDuplicates(config, batch.entries, learned)
-                            } catch (e: IOException) {
-                                throw IOException("查重失败，未跳过任何词。请检查模型设置后重试。\n${e.message.orEmpty()}", e)
                             }
-                        }
-                        indexes = withContext(Dispatchers.IO) {
-                            ensureActive()
-                            if (!store.applyDedup(batch, duplicates)) {
-                                throw IOException("词书状态已更新，未应用本次查重结果。请重试。")
+                            withContext(Dispatchers.IO) {
+                                ensureActive()
+                                if (!store.applyDedup(batch, duplicates, prefetch = true)) throw IOException()
                             }
-                            store.pendingLearning(id)
+                        } catch (_: IOException) {
+                            dedupFailure = "查重未完成，没有跳过任何词。请检查模型配置或网络后重试。"
                         }
                     }
                 }
-                learningBatch = if (indexes.isNotEmpty()) {
-                    if (indexes.any { it !in book.words.indices }) {
-                        LearningBatch(status = "词书内容已更新，请返回首页重新开始。", canRetry = false)
-                    } else LearningBatch(indexes)
-                } else {
-                    val exhausted = withContext(Dispatchers.IO) { store.position(id) >= book.words.size }
-                    if (exhausted) LearningBatch(status = "这本词书没有剩余新词。", canRetry = false)
-                    else LearningBatch(status = "本批没有可学词条。点击继续检查下一批。")
+                val failure = dedupFailure
+                learningBatch = withContext(Dispatchers.IO) {
+                    val entries = store.pendingLearningEntries(id)
+                    when {
+                        entries.isNotEmpty() -> LearningBatch(entries, failure)
+                        failure != null -> LearningBatch(status = failure)
+                        store.position(id) >= book.words.size -> LearningBatch(status = "这本词书没有剩余新词。", canRetry = false)
+                        else -> LearningBatch(status = "本批没有可学词条。点击继续检查下一批。")
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
-                learningBatch = LearningBatch(status = (e as? IOException)?.message ?: "读取学习列表失败，请重试。")
+            } catch (_: Exception) {
+                learningBatch = LearningBatch(learningBatch?.entries.orEmpty(), "读取学习列表失败，请重试。")
             } finally {
-                checkingDuplicates = false
+                if (studyBookId == id && learningRefresh == attempt) preparingLearning = false
             }
         }
     }
@@ -469,20 +486,24 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                             "learn" -> {
                                 val id = studyBookId
                                 val batch = learningBatch
-                                val index = batch?.indexes?.firstOrNull()
-                                val word = index?.let { learningBook?.words?.getOrNull(it) }
-                                if (index == null || word == null) {
+                                val entry = batch?.entries?.firstOrNull()
+                                if (batch == null || entry == null) {
                                     SettingsPage {
                                         ScreenHeader("学习", ::back)
-                                        Text(batch?.status ?: "正在准备学习词条…")
-                                        if (batch?.canRetry == true) {
-                                            TextButton(onClick = { learningRefresh++ }) { Text("继续 / 重试") }
+                                        Text(when {
+                                            preparingLearning || batch == null -> "正在准备学习词条…"
+                                            batch.status != null -> batch.status
+                                            else -> "本批没有可学词条。"
+                                        })
+                                        if (!preparingLearning && batch?.canRetry == true) {
+                                            TextButton(onClick = ::retryLearning) { Text("继续 / 重试") }
                                         }
                                     }
                                 } else {
+                                    val (index, word) = entry
                                     fun resolve(discard: Boolean) {
-                                        if (stack.last() != "learn" || studyBookId != id || actionJob != null ||
-                                            learningBatch?.indexes?.firstOrNull() != index
+                                        if (stack.last() != "learn" || studyBookId != id || actionJob != null || preparingLearning ||
+                                            learningBatch?.entries?.firstOrNull() != entry
                                         ) return
                                         studyError = null
                                         perform({ studyError = it }) {
@@ -495,11 +516,12 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                             }
                                             if (learnedToday != null) today = learnedToday
                                             counterRefresh++
-                                            if (!changed || pending.isEmpty()) {
-                                                learningBatch = null
+                                            val remaining = batch.entries.filter { it.index in pending }
+                                            learningBatch = batch.copy(entries = remaining)
+                                            // Trigger only after a user action, never from the refill result itself.
+                                            if (!changed || pending.size <= LEARNING_REFILL_AT) {
+                                                preparingLearning = true
                                                 learningRefresh++
-                                            } else {
-                                                learningBatch = LearningBatch(pending)
                                             }
                                         }
                                     }
@@ -511,9 +533,12 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                         answer = null,
                                         onAnswerChange = {},
                                         feedback = null,
-                                        busy = actionJob != null,
+                                        busy = actionJob != null || preparingLearning,
                                         primaryLabel = "下一词",
                                         error = studyError,
+                                        workspaceStatus = if (preparingLearning) "正在补充学习队列…" else batch.status,
+                                        onWorkspaceRetry = if (!preparingLearning && batch.status != null) ::retryLearning else null,
+                                        onModelLookup = { searchVocabulary(word.term) },
                                         onPrimary = { resolve(discard = false) },
                                         onDiscard = {
                                             discardConfirmation = DiscardConfirmation("丢弃此词？它将不再进入学习或复习。") {
@@ -542,7 +567,8 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                     }
                                 } else {
                                     val displayedReveal = reveal?.takeIf { it.card == card }
-                                    val prompt = displayedReveal == null
+                                    val missingMeaning = word.reviewMeanings.isEmpty()
+                                    val prompt = displayedReveal == null && !missingMeaning
                                     fun canAct() = stack.last() == "review" && reviewQueue.getOrNull(current) == card &&
                                         reveal == displayedReveal && !reviewStale && !reviewCommitPending && actionJob == null
 
@@ -567,6 +593,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                         onBack = ::back,
                                         onLookupWord = onLookupWord,
                                         answer = if (prompt) answer else null,
+                                        onModelLookup = if (prompt) null else ({ searchVocabulary(word.term) }),
                                         onAnswerChange = {
                                             if (canAct()) {
                                                 answer = it.take(1000)
@@ -576,7 +603,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                         feedback = when (displayedReveal?.correct) {
                                             true -> "回答正确"
                                             false -> "回答不够准确。请查看下方释义和例句；复习计划已重置，明天（北京时间）再复习。"
-                                            null -> null
+                                            null -> if (missingMeaning) "此词条没有可判定的释义。本次跳过，不更改复习进度。" else null
                                         },
                                         busy = busy,
                                         primaryLabel = when {
@@ -612,7 +639,7 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
                                                     studyError = null
                                                     perform({ studyError = it }) {
                                                         val discarded = commitReview {
-                                                            store.discardReview(card.toCard(), afterGrade = !prompt)
+                                                            store.discardReview(card.toCard(), afterGrade = displayedReveal != null)
                                                         }
                                                         counterRefresh++
                                                         if (discarded) advanceReview() else reviewStale = true
@@ -654,18 +681,18 @@ private fun VocabularyApp(lifecycle: Lifecycle, onLookupWord: (String) -> Unit) 
             )
         }
     }
-    if (route == "learn" && checkingDuplicates) {
-        val cancelCheck: () -> Unit = ::back
+    lookupResult?.let { (term, result) ->
+        val dismiss = { lookupResult = null }
         AlertDialog(
-            onDismissRequest = cancelCheck,
-            title = { Text("正在检查重复词") },
+            onDismissRequest = dismiss,
+            title = { Text(term) },
             text = {
-                Column {
-                    CircularProgressIndicator(Modifier.padding(bottom = 12.dp))
-                    Text("正在准备本组学习词条。取消不会撤销已保存的查重结果。")
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("模型生成的释义，非实时网页搜索，不会修改词书。")
+                    result.forEach { Text("(${it.pos}) ${it.definition}") }
                 }
             },
-            confirmButton = { TextButton(onClick = cancelCheck) { Text("取消") } },
+            confirmButton = { TextButton(onClick = dismiss) { Text("确定") } },
         )
     }
     discardConfirmation?.let { pending ->
